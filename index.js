@@ -28,6 +28,7 @@ const dbClient = await connectToDatabase();
 const db = dbClient.db("pizzahub");
 const pizzasCollection = db.collection("pizza");
 const menuCollection = db.collection("menu")
+const orders = db.collection("orders");
 
 
 app.get("/", (req, res) => {
@@ -53,8 +54,29 @@ app.post("/menu", async (req,res)=>{
 })
 
 app.get("/menu",async (req,res)=>{
-    const cursor = menuCollection.find();
-    const result = await cursor.toArray();
+
+    const query = {};
+    const { category, location, name, search } = req.query;
+
+    if (category && category !== "all") query.category = category;
+    if (location && location !== "all") query.location = location;
+    if (name) query.name = { $regex: name, $options: "i" };
+    if (search) {
+      query.$or = [
+        { name: { $regex: search, $options: "i" } },
+        { description: { $regex: search, $options: "i" } },
+        { category: { $regex: search, $options: "i" } },
+        { location: { $regex: search, $options: "i" } },
+      ];
+    }
+
+    const result = await menuCollection.find(query).toArray();
+    res.send(result);
+})
+app.get("/menu/:id", async (req,res)=>{
+    const id = req.params.id;
+    const query = {_id:new ObjectId(id)};
+    const result = await menuCollection.findOne(query);
     res.send(result);
 })
 
@@ -65,7 +87,18 @@ app.delete("/menu/:id",async (req,res)=>{
     res.send(result);
 })
 
+// Order Related Api's
+app.post("/orders", async (req,res)=>{
+    const order = req.body;
+    const result = await orders.insertOne(order);
+    res.send(result);
+})
 
+app.get("/orders",async (req,res)=>{
+
+    const query ={};
+    if
+})
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
 });
