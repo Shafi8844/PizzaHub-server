@@ -27,6 +27,8 @@ export async function connectToDatabase() {
 const dbClient = await connectToDatabase();
 const db = dbClient.db("pizzahub");
 const pizzasCollection = db.collection("pizza");
+const foodsCollection=db.collection("foods");
+const menuCollection = db.collection("menu")
 
 
 app.get("/", (req, res) => {
@@ -44,7 +46,23 @@ app.get("/users", async (req, res) => {
   }
 });
 
+// menu related Api
+app.post("/menu", async (req,res)=>{
+    const item=req.body;
+    const result= await menuCollection.insertOne(item);
+    res.send(result);
+})
 
+app.get('/menu',async (req,res)=>{
+    try {
+        const menuItems= menuCollection.find();
+        const result = menuItems.toArray();
+        res.send(result)
+    }catch (error){
+        console.error("Error fetching menu:", error);
+        res.status(500).json({ error: "Internal Server Error" });
+    }
+})
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
 });
