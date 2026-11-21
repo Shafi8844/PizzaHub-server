@@ -1,6 +1,6 @@
 import express from "express";
 import cors from "cors";
-import { MongoClient } from "mongodb";
+import {MongoClient, ObjectId} from "mongodb";
 import 'dotenv/config';
 
 const app = express();
@@ -27,7 +27,6 @@ export async function connectToDatabase() {
 const dbClient = await connectToDatabase();
 const db = dbClient.db("pizzahub");
 const pizzasCollection = db.collection("pizza");
-const foodsCollection=db.collection("foods");
 const menuCollection = db.collection("menu")
 
 
@@ -53,16 +52,20 @@ app.post("/menu", async (req,res)=>{
     res.send(result);
 })
 
-app.get('/menu',async (req,res)=>{
-    try {
-        const menuItems= menuCollection.find();
-        const result = menuItems.toArray();
-        res.send(result)
-    }catch (error){
-        console.error("Error fetching menu:", error);
-        res.status(500).json({ error: "Internal Server Error" });
-    }
+app.get("/menu",async (req,res)=>{
+    const cursor = menuCollection.find();
+    const result = await cursor.toArray();
+    res.send(result);
 })
+
+app.delete("/menu/:id",async (req,res)=>{
+    const id = req.params.id;
+    const query = {_id:new ObjectId(id)}
+    const result= await menuCollection.deleteOne(query);
+    res.send(result);
+})
+
+
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
 });
