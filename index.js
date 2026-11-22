@@ -1,18 +1,20 @@
 import express from "express";
 import cors from "cors";
-import { createHmac, timingSafeEqual } from "node:crypto";
 import {MongoClient, ObjectId} from "mongodb";
 import 'dotenv/config';
 import {Stripe} from "stripe";
+import { createRemoteJWKSet, jwtVerify } from "jose";
 
 if (!process.env.STRIPE_SECRET_KEY) throw new Error("STRIPE_SECRET_KEY is required");
 if (!process.env.MONGO_DB_URI) throw new Error("MONGO_DB_URI is required");
-if (!process.env.BETTER_AUTH_SECRET) throw new Error("BETTER_AUTH_SECRET is required");
+if (!process.env.BETTER_AUTH_URL) throw new Error("BETTER_AUTH_URL is required");
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY)
 
 const app = express();
 const PORT = process.env.PORT || 5050;
+const authBaseUrl = process.env.BETTER_AUTH_URL.replace(/\/+$/, "");
+const JWKS = createRemoteJWKSet(new URL(`${authBaseUrl}/api/auth/jwks`));
 
 
 const allowedOrigins = (process.env.CORS_ORIGINS || "http://localhost:3000")
@@ -152,16 +154,48 @@ app.post("/webhooks/stripe", express.raw({ type: "application/json" }), async (r
 
 app.use(express.json());
 
+const JWT_AUDIENCE = "pizzahub-api";
+const ALLOWED_ROLES = ["customer", "vendor", "admin"];
+const USER_PROJECTION = {
+    id: 1,
+    name: 1,
+    email: 1,
+    role: 1,
+    blocked: 1,
+    banned: 1,
+    banExpires: 1,
+    subscriptionPlan: 1,
+    subscriptionExpiresAt: 1,
+};
+
+// Tolerate a trailing slash in BETTER_AUTH_URL so the issuer check cannot silently
+// reject every token when the env var is written as "https://app.example.com/".
+// jose compares issuers with Array.includes, so both forms are listed explicitly.
+const JWT_ISSUERS = [authBaseUrl, `${authBaseUrl}/`];
+
+function fail(res, status, message) {
+    return res.status(status).send({ error: message, message });
+}
+
 function unauthorized(res, message = "Authentication required") {
-    return res.status(401).send({ error: message });
+    return fail(res, 401, message);
 }
 
 function forbidden(res, message = "You do not have permission to do that") {
-    return res.status(403).send({ error: message });
+    return fail(res, 403, message);
 }
 
 function hasRole(user, ...roles) {
     return Boolean(user && roles.includes(user.role));
+}
+
+function requireRole(roles, message = "You do not have permission to do that") {
+    const allowed = Array.isArray(roles) ? roles : [roles];
+    return (req, res, next) => {
+        if (!req.user) return unauthorized(res);
+        if (!allowed.includes(req.user.role)) return forbidden(res, message);
+        return next();
+    };
 }
 
 function hasActivePremium(user) {
@@ -169,61 +203,131 @@ function hasActivePremium(user) {
     return user?.subscriptionPlan === "premium" && Number.isFinite(expiresAt) && expiresAt > Date.now();
 }
 
-async function authenticateOptional(req, res, next) {
-    const authorization = req.headers.authorization;
-    if (!authorization) {
-        req.user = null;
-        return next();
-    }
+// Better Auth's admin plugin stores `banned` plus an optional `banExpires`, so a
+// temporary ban must stop counting once it has expired.
+function isAccountBlocked(user) {
+    if (user.blocked) return true;
+    if (!user.banned) return false;
+    if (!user.banExpires) return true;
+    const expiresAt = new Date(user.banExpires).getTime();
+    return !Number.isFinite(expiresAt) || expiresAt > Date.now();
+}
 
-    const [scheme, token] = authorization.split(" ");
-    if (scheme !== "Bearer" || !token) return unauthorized(res, "Invalid bearer token");
+// A valid JWT only proves identity. Mirror the Better Auth user into our own
+// collection so the API can keep working if the record is missing.
+async function syncUserFromClaims(claims) {
+    if (typeof claims.email !== "string" || !claims.email) return null;
+
+    const role = ALLOWED_ROLES.includes(claims.role) ? claims.role : "customer";
+    const now = new Date();
+    const document = {
+        email: claims.email,
+        name: typeof claims.name === "string" ? claims.name : "",
+        role,
+        emailVerified: false,
+        blocked: false,
+        premium: false,
+        subscriptionPlan: "free",
+        createdAt: now,
+        updatedAt: now,
+    };
+    const objectId = /^[a-f\d]{24}$/i.test(claims.sub) ? new ObjectId(claims.sub) : null;
+    if (objectId) document._id = objectId;
+    else document.id = claims.sub;
 
     try {
-        const parts = token.split(".");
-        if (parts.length !== 3) return unauthorized(res, "Invalid bearer token");
-        const [headerPart, payloadPart, signaturePart] = parts;
-        const header = JSON.parse(Buffer.from(headerPart, "base64url").toString("utf8"));
-        const claims = JSON.parse(Buffer.from(payloadPart, "base64url").toString("utf8"));
-        if (header.alg !== "HS256" || header.typ !== "JWT") return unauthorized(res, "Invalid bearer token");
+        await users.insertOne(document);
+        console.log("Synced user from Better Auth token:", claims.email);
+    } catch (error) {
+        // Another concurrent request may have inserted the same account first.
+        if (error?.code !== 11000) throw error;
+    }
 
-        const expected = createHmac("sha256", process.env.BETTER_AUTH_SECRET)
-            .update(`${headerPart}.${payloadPart}`)
-            .digest();
-        const received = Buffer.from(signaturePart, "base64url");
-        if (received.length !== expected.length || !timingSafeEqual(received, expected)) {
-            return unauthorized(res, "Invalid bearer token");
-        }
-        const now = Math.floor(Date.now() / 1000);
-        if (claims.iss !== "pizzahub-client" || claims.aud !== "pizzahub-api" ||
-            typeof claims.sub !== "string" || !Number.isInteger(claims.iat) ||
-            !Number.isInteger(claims.exp) || claims.iat > now || claims.exp <= now || claims.exp > claims.iat + 300) {
-            return unauthorized(res, "Expired or invalid bearer token");
-        }
+    return users.findOne(objectId ? { _id: objectId } : { id: claims.sub }, { projection: USER_PROJECTION });
+}
 
-        const user = await users.findOne(
-            userIdQuery(claims.sub),
-            { projection: { id: 1, name: 1, email: 1, role: 1, blocked: 1, banned: 1, subscriptionPlan: 1, subscriptionExpiresAt: 1 } }
-        );
-        if (!user) return unauthorized(res, "Account no longer exists");
-        if (user.blocked || user.banned) return forbidden(res, "This account is blocked");
-        req.user = user;
-        return next();
+async function resolveUser(req) {
+    const authorization = req.headers.authorization;
+    if (!authorization) return { status: "anonymous" };
+
+    const [scheme, token] = authorization.trim().split(/\s+/);
+    if (!scheme || scheme.toLowerCase() !== "bearer" || !token) return { status: "invalid" };
+
+    let claims;
+    try {
+        ({ payload: claims } = await jwtVerify(token, JWKS, {
+            issuer: JWT_ISSUERS,
+            audience: JWT_AUDIENCE,
+        }));
     } catch {
-        return unauthorized(res, "Invalid bearer token");
+        return { status: "invalid" };
+    }
+
+    if (typeof claims.sub !== "string" || !claims.sub) return { status: "invalid" };
+
+    let user = await users.findOne(userIdQuery(claims.sub), { projection: USER_PROJECTION });
+    if (!user) user = await syncUserFromClaims(claims);
+    if (!user) return { status: "invalid" };
+    if (isAccountBlocked(user)) return { status: "blocked" };
+
+    return {
+        status: "authenticated",
+        user: {
+            id: user._id?.toString() || user.id,
+            email: user.email,
+            name: user.name,
+            role: user.role,
+            blocked: user.blocked,
+            subscriptionPlan: user.subscriptionPlan,
+            subscriptionExpiresAt: user.subscriptionExpiresAt,
+        },
+    };
+}
+
+async function authenticate(req, res, next) {
+    try {
+        const result = await resolveUser(req);
+        if (result.status === "blocked") return forbidden(res, "This account is blocked");
+        if (result.status === "anonymous") return unauthorized(res);
+        if (result.status !== "authenticated") return unauthorized(res, "Invalid bearer token");
+        req.user = result.user;
+        return next();
+    } catch (error) {
+        console.error("Error authenticating request:", error);
+        return unauthorized(res);
     }
 }
 
-app.use(["/menu", "/orders", "/users", "/transactions"], authenticateOptional);
+async function authenticateOptional(req, res, next) {
+    try {
+        const result = await resolveUser(req);
+        // Public endpoints degrade to anonymous access instead of failing, so an
+        // expired token never blocks browsing.
+        req.user = result.status === "authenticated" ? result.user : null;
+    } catch (error) {
+        console.error("Error authenticating request:", error);
+        req.user = null;
+    }
+    return next();
+}
+
+const PUBLIC_GET_ROUTES = [/^\/$/, /^\/menu$/, /^\/menu\/count$/, /^\/menu\/[^/]+$/i];
+
+function isPublicRoute(req) {
+    return req.method === "GET" && PUBLIC_GET_ROUTES.some((pattern) => pattern.test(req.path));
+}
+
+// Authentication is fail-closed: any route that is not explicitly public requires
+// a valid token, so newly added endpoints cannot be forgotten.
+app.use((req, res, next) => (isPublicRoute(req) ? authenticateOptional(req, res, next) : authenticate(req, res, next)));
 
 
 app.get("/", (req, res) => {
   res.send("Hello from the backend!");
 });
 
-app.get("/users", async (req, res) => {
+app.get("/users", requireRole("admin", "Admin access required"), async (req, res) => {
   try {
-    if (!hasRole(req.user, "admin")) return req.user ? forbidden(res) : unauthorized(res);
     const query = {};
     const { role, search } = req.query;
     if (role && role !== "all") query.role = role;
@@ -240,37 +344,35 @@ app.get("/users", async (req, res) => {
     res.json(result);
   } catch (error) {
     console.error("Error fetching users:", error);
-    res.status(500).json({ error: "Internal Server Error" });
+    fail(res, 500, "Internal Server Error");
   }
 });
 
-app.patch("/users/:id", async (req, res) => {
+app.patch("/users/:id", requireRole("admin", "Admin access required"), async (req, res) => {
   try {
-    if (!hasRole(req.user, "admin")) return req.user ? forbidden(res) : unauthorized(res);
     const id = req.params.id;
     if (id === req.user.id) return forbidden(res, "You cannot change your own admin account");
     const updates = {};
     if (typeof req.body.blocked === "boolean") updates.blocked = req.body.blocked;
     if (typeof req.body.role === "string") {
-      if (!["customer", "vendor", "admin"].includes(req.body.role)) {
-        return res.status(400).send({ error: "Invalid account role" });
+      if (!ALLOWED_ROLES.includes(req.body.role)) {
+        return fail(res, 400, "Invalid account role");
       }
       updates.role = req.body.role;
     }
-    if (!Object.keys(updates).length) return res.status(400).send({ error: "No valid user changes provided" });
+    if (!Object.keys(updates).length) return fail(res, 400, "No valid user changes provided");
     const query = ObjectId.isValid(id) ? { _id: new ObjectId(id) } : { id };
     const result = await users.updateOne(query, { $set: updates });
-    if (!result.matchedCount) return res.status(404).send({ error: "User not found" });
+    if (!result.matchedCount) return fail(res, 404, "User not found");
     res.send(result);
   } catch (error) {
     console.error("Error updating user:", error);
-    res.status(500).json({ error: "Internal Server Error" });
+    fail(res, 500, "Internal Server Error");
   }
 });
 
-app.get("/transactions", async (req, res) => {
+app.get("/transactions", requireRole("admin", "Admin access required"), async (req, res) => {
   try {
-    if (!hasRole(req.user, "admin")) return req.user ? forbidden(res) : unauthorized(res);
     const result = await transactions.find({}).sort({ createdAt: -1 }).toArray();
     const vendorIds = [...new Set(result.map((transaction) => transaction.vendorId).filter(Boolean))];
     const vendorProfiles = vendorIds.length
@@ -284,14 +386,13 @@ app.get("/transactions", async (req, res) => {
     })));
   } catch (error) {
     console.error("Error fetching transactions:", error);
-    return res.status(500).send({ error: "Unable to fetch transactions" });
+    return fail(res, 500, "Unable to fetch transactions");
   }
 });
 
 // menu related Api
-app.post("/menu", async (req, res) => {
+app.post("/menu", requireRole("vendor", "Only vendors can publish menu items"), async (req, res) => {
   try {
-    if (!hasRole(req.user, "vendor")) return req.user ? forbidden(res) : unauthorized(res);
     const { itemName, category, description, price, location, images } = req.body;
     if (typeof itemName !== "string" || !itemName.trim() ||
         typeof category !== "string" || !category.trim() ||
@@ -300,13 +401,13 @@ app.post("/menu", async (req, res) => {
         !Number.isFinite(Number(price)) || Number(price) <= 0 ||
         !Array.isArray(images) || images.length === 0 ||
         images.some((image) => typeof image !== "string" || !/^https:\/\//i.test(image))) {
-      return res.status(400).send({ error: "Provide a name, category, description, positive price, location, and image URL" });
+      return fail(res, 400, "Provide a name, category, description, positive price, location, and image URL");
     }
 
     const isPremium = hasActivePremium(req.user);
     const activeCount = await menuCollection.countDocuments({ vendorId: req.user.id, status: "approved" });
     if (!isPremium && activeCount >= 3) {
-      return res.status(403).send({ error: "Free vendors can publish up to 3 menu items. Upgrade to Premium for more." });
+      return fail(res, 403, "Free vendors can publish up to 3 menu items. Upgrade to Premium for more.");
     }
 
     const result = await menuCollection.insertOne({
@@ -323,7 +424,7 @@ app.post("/menu", async (req, res) => {
     return res.send(result);
   } catch (error) {
     console.error("Error creating menu item:", error);
-    return res.status(500).send({ error: "Unable to create menu item" });
+    return fail(res, 500, "Unable to create menu item");
   }
 });
 
@@ -367,17 +468,27 @@ app.get("/menu", async (req, res) => {
     const vendorProfiles = vendorIds.length
       ? await users.find(
           userIdsQuery(vendorIds),
-          { projection: { id: 1, name: 1, businessName: 1 } }
+          { projection: { id: 1, name: 1, businessName: 1, subscriptionPlan: 1, subscriptionExpiresAt: 1 } }
         ).toArray()
       : [];
     const vendorsById = mapUsersById(vendorProfiles);
+    const approvedCounts = vendorIds.length
+      ? await menuCollection.aggregate([
+          { $match: { vendorId: { $in: vendorIds }, status: "approved" } },
+          { $group: { _id: "$vendorId", count: { $sum: 1 } } },
+        ]).toArray()
+      : [];
+    const approvedCountsByVendor = new Map(approvedCounts.map(({ _id, count }) => [_id, count]));
     return res.send(result.map((item) => ({
       ...item,
       vendorName: vendorsById.get(item.vendorId)?.businessName || vendorsById.get(item.vendorId)?.name || "Local restaurant",
+      canApprove: item.status === "approved" ||
+        hasActivePremium(vendorsById.get(item.vendorId)) ||
+        (approvedCountsByVendor.get(item.vendorId) || 0) < 3,
     })));
   } catch (error) {
     console.error("Error fetching menu items:", error);
-    return res.status(500).send({ error: "Unable to fetch menu items" });
+    return fail(res, 500, "Unable to fetch menu items");
   }
 });
 
@@ -400,23 +511,22 @@ app.get("/menu/count", async (req, res) => {
 
 app.get("/menu/:id", async (req, res) => {
   const id = req.params.id;
-  if (!ObjectId.isValid(id)) return res.status(400).send({ error: "Invalid menu item ID" });
+  if (!ObjectId.isValid(id)) return fail(res, 400, "Invalid menu item ID");
   const query = { _id: new ObjectId(id) };
   const result = await menuCollection.findOne(query);
-  if (!result) return res.status(404).send({ error: "Menu item not found" });
+  if (!result) return fail(res, 404, "Menu item not found");
   if (hasRole(req.user, "admin")) return res.send(result);
   if (hasRole(req.user, "vendor") && result.vendorId === req.user.id) return res.send(result);
-  if (result.status !== "approved") return res.status(404).send({ error: "Menu item not found" });
+  if (result.status !== "approved") return fail(res, 404, "Menu item not found");
   return res.send(result);
 });
 
-app.patch("/menu/:id", async (req, res) => {
+app.patch("/menu/:id", requireRole(["admin", "vendor"]), async (req, res) => {
   try {
-    if (!hasRole(req.user, "admin", "vendor")) return req.user ? forbidden(res) : unauthorized(res);
     const id = req.params.id;
-    if (!ObjectId.isValid(id)) return res.status(400).send({ error: "Invalid menu item ID" });
+    if (!ObjectId.isValid(id)) return fail(res, 400, "Invalid menu item ID");
     const item = await menuCollection.findOne({ _id: new ObjectId(id) });
-    if (!item) return res.status(404).send({ error: "Menu item not found" });
+    if (!item) return fail(res, 404, "Menu item not found");
     const isAdmin = hasRole(req.user, "admin");
     if (!isAdmin && item.vendorId !== req.user.id) return forbidden(res);
 
@@ -428,47 +538,46 @@ app.patch("/menu/:id", async (req, res) => {
     delete updates.vendorId;
     for (const key of ["itemName", "category", "description", "location"]) {
       if (key in updates && (typeof updates[key] !== "string" || !updates[key].trim())) {
-        return res.status(400).send({ error: `${key} must be a non-empty string` });
+        return fail(res, 400, `${key} must be a non-empty string`);
       }
       if (typeof updates[key] === "string") updates[key] = updates[key].trim();
     }
     if ("price" in updates && (!Number.isFinite(Number(updates.price)) || Number(updates.price) <= 0)) {
-      return res.status(400).send({ error: "Price must be greater than zero" });
+      return fail(res, 400, "Price must be greater than zero");
     }
     if ("price" in updates) updates.price = Number(updates.price);
     if ("images" in updates && (!Array.isArray(updates.images) || updates.images.length === 0 ||
       updates.images.some((image) => typeof image !== "string" || !/^https:\/\//i.test(image)))) {
-      return res.status(400).send({ error: "At least one valid image URL is required" });
+      return fail(res, 400, "At least one valid image URL is required");
     }
     if (updates.status && !isAdmin && updates.status !== "inactive") {
       return forbidden(res, "Vendors cannot approve or publish menu items");
     }
     if (updates.status && !["pending", "approved", "rejected", "inactive"].includes(updates.status)) {
-      return res.status(400).send({ error: "Invalid menu item status" });
+      return fail(res, 400, "Invalid menu item status");
     }
     if (isAdmin && updates.status === "approved" && item.status !== "approved") {
       const vendor = await users.findOne(userIdQuery(item.vendorId), { projection: { subscriptionPlan: 1, subscriptionExpiresAt: 1 } });
       const isPremium = hasActivePremium(vendor);
       const approvedCount = await menuCollection.countDocuments({ vendorId: item.vendorId, status: "approved" });
       if (!isPremium && approvedCount >= 3) {
-        return res.status(409).send({ error: "This vendor has reached the 3-item Free plan limit" });
+        return fail(res, 409, "This vendor has reached the 3-item Free plan limit");
       }
     }
-    if (!Object.keys(updates).length) return res.status(400).send({ error: "No valid menu item changes provided" });
+    if (!Object.keys(updates).length) return fail(res, 400, "No valid menu item changes provided");
     const result = await menuCollection.updateOne({ _id: new ObjectId(id) }, { $set: updates });
     return res.send(result);
   } catch (error) {
     console.error("Error updating menu item:", error);
-    return res.status(500).send({ error: "Unable to update menu item" });
+    return fail(res, 500, "Unable to update menu item");
   }
 });
 
-app.delete("/menu/:id", async (req, res) => {
-  if (!hasRole(req.user, "admin", "vendor")) return req.user ? forbidden(res) : unauthorized(res);
+app.delete("/menu/:id", requireRole(["admin", "vendor"]), async (req, res) => {
   const id = req.params.id;
-  if (!ObjectId.isValid(id)) return res.status(400).send({ error: "Invalid menu item ID" });
+  if (!ObjectId.isValid(id)) return fail(res, 400, "Invalid menu item ID");
   const item = await menuCollection.findOne({ _id: new ObjectId(id) });
-  if (!item) return res.status(404).send({ error: "Menu item not found" });
+  if (!item) return fail(res, 404, "Menu item not found");
   if (!hasRole(req.user, "admin") && item.vendorId !== req.user.id) return forbidden(res);
   const query = { _id: new ObjectId(id) };
   const result = await menuCollection.deleteOne(query);
@@ -476,28 +585,27 @@ app.delete("/menu/:id", async (req, res) => {
 });
 
 // Order Related Api's
-app.post("/orders", async (req, res) => {
+app.post("/orders", requireRole("customer", "Only customers can place orders"), async (req, res) => {
   try {
-    if (!hasRole(req.user, "customer")) return req.user ? forbidden(res, "Only customers can place orders") : unauthorized(res);
     const { menuItemId, quantity = 1, deliveryAddress, deliveryDate, note = "" } = req.body;
     if (typeof menuItemId !== "string" || !ObjectId.isValid(menuItemId) ||
         typeof deliveryAddress !== "string" || deliveryAddress.trim().length < 8 ||
         typeof deliveryDate !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(deliveryDate)) {
-      return res.status(400).send({ error: "Provide a valid item, delivery date, and address" });
+      return fail(res, 400, "Provide a valid item, delivery date, and address");
     }
     const requestedDate = new Date(`${deliveryDate}T00:00:00.000Z`);
     const today = new Date();
     today.setUTCHours(0, 0, 0, 0);
     if (Number.isNaN(requestedDate.getTime()) || requestedDate.toISOString().slice(0, 10) !== deliveryDate || requestedDate < today) {
-      return res.status(400).send({ error: "Delivery date must be today or later" });
+      return fail(res, 400, "Delivery date must be today or later");
     }
     const safeQuantity = Number(quantity);
     if (!Number.isInteger(safeQuantity) || safeQuantity < 1 || safeQuantity > 20) {
-      return res.status(400).send({ error: "Quantity must be between 1 and 20" });
+      return fail(res, 400, "Quantity must be between 1 and 20");
     }
 
     const item = await menuCollection.findOne({ _id: new ObjectId(menuItemId), status: "approved" });
-    if (!item) return res.status(404).send({ error: "This menu item is unavailable" });
+    if (!item) return fail(res, 404, "This menu item is unavailable");
     if (item.vendorId === req.user.id) return forbidden(res, "You cannot order your own menu item");
 
     const duplicate = await orders.findOne({
@@ -506,7 +614,7 @@ app.post("/orders", async (req, res) => {
       deliveryDate,
       status: { $in: ["pending", "accepted"] },
     });
-    if (duplicate) return res.status(409).send({ error: "You already have an active order for this item and date" });
+    if (duplicate) return fail(res, 409, "You already have an active order for this item and date");
 
     const payload = {
       menuItemId: item._id.toString(),
@@ -530,7 +638,7 @@ app.post("/orders", async (req, res) => {
     return res.send(result);
   } catch (error) {
     console.error("Error creating order:", error);
-    return res.status(500).send({ error: "Unable to place order" });
+    return fail(res, 500, "Unable to place order");
   }
 });
 
@@ -545,7 +653,7 @@ app.get("/orders", async (req, res) => {
   } else if (hasRole(req.user, "customer")) {
     query.customerId = req.user.id;
   } else {
-    return req.user ? forbidden(res) : unauthorized(res);
+    return forbidden(res);
   }
   if (status && status !== "all") query.status = status;
   try {
@@ -553,7 +661,7 @@ app.get("/orders", async (req, res) => {
     return res.send(result);
   } catch (error) {
     console.error("Error fetching orders:", error);
-    return res.status(500).send({ error: "Unable to fetch orders" });
+    return fail(res, 500, "Unable to fetch orders");
   }
 });
 
@@ -568,7 +676,7 @@ app.get("/orders/count", async (req, res) => {
   } else if (hasRole(req.user, "customer")) {
     query.customerId = req.user.id;
   } else {
-    return req.user ? forbidden(res) : unauthorized(res);
+    return forbidden(res);
   }
   if (status && status !== "all") query.status = status;
   const result = await orders.countDocuments(query);
@@ -577,36 +685,35 @@ app.get("/orders/count", async (req, res) => {
 
 app.patch("/orders/:id", async (req, res) => {
   try {
-    if (!req.user) return unauthorized(res);
     const id = req.params.id;
-    if (!ObjectId.isValid(id)) return res.status(400).send({ error: "Invalid order ID" });
+    if (!ObjectId.isValid(id)) return fail(res, 400, "Invalid order ID");
     if (Object.keys(req.body).some((key) => key !== "status")) {
-      return res.status(400).send({ error: "Only order status can be changed" });
+      return fail(res, 400, "Only order status can be changed");
     }
     const nextStatus = req.body.status;
     if (!["accepted", "rejected", "cancelled"].includes(nextStatus)) {
-      return res.status(400).send({ error: "Invalid order status" });
+      return fail(res, 400, "Invalid order status");
     }
     const existing = await orders.findOne({ _id: new ObjectId(id) });
-    if (!existing) return res.status(404).send({ error: "Order not found" });
+    if (!existing) return fail(res, 404, "Order not found");
 
     const vendorAction = nextStatus === "accepted" || nextStatus === "rejected";
     const customerAction = nextStatus === "cancelled";
     if (vendorAction && (!hasRole(req.user, "vendor") || existing.vendorId !== req.user.id)) return forbidden(res);
     if (customerAction && (!hasRole(req.user, "customer") || existing.customerId !== req.user.id)) return forbidden(res);
     if (existing.status !== "pending") {
-      return res.status(409).send({ error: "Only pending orders can be changed" });
+      return fail(res, 409, "Only pending orders can be changed");
     }
 
     const result = await orders.updateOne(
       { _id: new ObjectId(id), status: "pending" },
       { $set: { status: nextStatus, updatedAt: new Date().toISOString() } }
     );
-    if (!result.modifiedCount) return res.status(409).send({ error: "Order status has already changed" });
+    if (!result.modifiedCount) return fail(res, 409, "Order status has already changed");
     return res.send(result);
   } catch (error) {
     console.error("Error updating order:", error);
-    res.status(500).json({ error: "Internal Server Error" });
+    fail(res, 500, "Internal Server Error");
   }
 });
 
