@@ -97,7 +97,12 @@ app.post("/orders", async (req,res)=>{
 app.get("/orders",async (req,res)=>{
 
     const query ={};
-    if
+    if(req.query.customerId){
+        query.customerId = req.query.customerId;
+    }
+    const cursor = orders.find(query);
+    const result = await cursor.toArray();
+    res.send(result);
 })
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
