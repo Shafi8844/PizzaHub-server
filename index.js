@@ -69,10 +69,22 @@ app.get("/menu",async (req,res)=>{
         { location: { $regex: search, $options: "i" } },
       ];
     }
-
+    if(req.query.vendorID){
+        query.vendorID = req.query.vendorID;
+    }
     const result = await menuCollection.find(query).toArray();
     res.send(result);
 })
+
+app.get("/menu/count",async (req,res)=>{
+    const query ={};
+    if(req.query.vendorId){
+        query.vendorId = req.query.vendorId;
+    }
+    const result = await menuCollection.countDocuments(query);
+    res.send({count:result});
+})
+
 app.get("/menu/:id", async (req,res)=>{
     const id = req.params.id;
     const query = {_id:new ObjectId(id)};
@@ -103,6 +115,15 @@ app.get("/orders",async (req,res)=>{
     const cursor = orders.find(query);
     const result = await cursor.toArray();
     res.send(result);
+})
+
+app.get("/orders/count",async (req,res)=>{
+    const query ={};
+    if(req.query.customerId){
+        query.customerId = req.query.customerId;
+    }
+    const result = await orders.countDocuments(query);
+    res.send({count:result});
 })
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
